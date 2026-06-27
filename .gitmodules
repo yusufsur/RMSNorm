@@ -1,9 +1,9 @@
 [submodule "precision_lib"]
-	path = precision_lib
+	path = rtl/precision_lib
 	url = https://github.com/yusufsur/precision_lib.git
 [submodule "FIFO-Library"]
-	path = FIFO-Library
+	path = rtl/FIFO-Library
 	url = https://github.com/yusufsur/FIFO-Library.git
 [submodule "sync_fifos"]
-	path = sync_fifos
+	path = rtl/sync_fifos
 	url = https://github.com/yusufsur/sync_fifos.git
