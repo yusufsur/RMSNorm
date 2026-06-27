@@ -81,15 +81,16 @@ done < "$root/sim/sources.f"
 
 inc_args=(
   "-I$root"
-  "-I$root/precision_lib/floating_point"
-  "-I$root/precision_lib/bfloat16"
+  "-I$root/rtl"
+  "-I$root/rtl/precision_lib/floating_point"
+  "-I$root/rtl/precision_lib/bfloat16"
 )
 
 cd "$build"
 
 if [[ "$sim" == "xsim" ]]; then
   xsim_inc_args=()
-  for dir in "$root" "$root/precision_lib/floating_point" "$root/precision_lib/bfloat16"; do
+  for dir in "$root" "$root/rtl" "$root/rtl/precision_lib/floating_point" "$root/rtl/precision_lib/bfloat16"; do
     xsim_inc_args+=("-i" "$dir")
   done
 

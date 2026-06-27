@@ -72,8 +72,9 @@ $Sources = Get-Content -LiteralPath $Manifest |
 
 $IncludeDirs = @(
     $Root,
-    (Join-Path $Root "precision_lib\floating_point"),
-    (Join-Path $Root "precision_lib\bfloat16")
+    (Join-Path $Root "rtl"),
+    (Join-Path $Root "rtl\precision_lib\floating_point"),
+    (Join-Path $Root "rtl\precision_lib\bfloat16")
 )
 
 Push-Location $Build
