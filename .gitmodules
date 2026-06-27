@@ -1,0 +1,6 @@
+[submodule "precision_lib"]
+	path = precision_lib
+	url = https://github.com/yusufsur/precision_lib.git
+[submodule "FIFO-Library"]
+	path = FIFO-Library
+	url = https://github.com/yusufsur/FIFO-Library.git

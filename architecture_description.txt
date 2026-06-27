@@ -1,0 +1,962 @@
+================================================================================
+RMSNorm Accelerator - RTL Block Diagram Specification
+================================================================================
+Author: Yusuf SUR
+Purpose: Detailed architecture for AI-assisted block diagram generation
+================================================================================
+
+This document provides comprehensive interconnection details for generating
+an accurate RTL block diagram of the RMSNorm hardware accelerator.
+
+================================================================================
+TOP-LEVEL HIERARCHY
+================================================================================
+
++------------------------------------------------------------------+
+|                    rms_norm_axi_wrapper                          |
+|  +------------------------------------------------------------+  |
+|  |                     rms_norm (core)                        |  |
+|  |   +------------------+      +-------------------+          |  |
+|  |   |   INPUT STAGE    |----->|   OUTPUT STAGE    |          |  |
+|  |   | (Accumulator FSM)|      | (Normalizer FSM)  |          |  |
+|  |   +------------------+      +-------------------+          |  |
+|  +------------------------------------------------------------+  |
++------------------------------------------------------------------+
+
+================================================================================
+PART 1: AXI WRAPPER MODULE (rms_norm_axi_wrapper.sv)
+================================================================================
+
+MODULE PORTS:
+-------------
+GLOBAL SIGNALS:
+  - aclk              : input  [1-bit]   - System clock
+  - aresetn           : input  [1-bit]   - Active-low reset
+  - interrupt         : output [1-bit]   - Completion interrupt
+
+AXI4-LITE CONTROL INTERFACE (s_axi_ctrl):
+  - s_axi_ctrl_awaddr  : input  [16-bit]  - Write address
+  - s_axi_ctrl_awprot  : input  [3-bit]   - Write protection
+  - s_axi_ctrl_awvalid : input  [1-bit]   - Write address valid
+  - s_axi_ctrl_awready : output [1-bit]   - Write address ready
+  - s_axi_ctrl_wdata   : input  [32-bit]  - Write data
+  - s_axi_ctrl_wstrb   : input  [4-bit]   - Write strobes
+  - s_axi_ctrl_wvalid  : input  [1-bit]   - Write valid
+  - s_axi_ctrl_wready  : output [1-bit]   - Write ready
+  - s_axi_ctrl_bresp   : output [2-bit]   - Write response
+  - s_axi_ctrl_bvalid  : output [1-bit]   - Write response valid
+  - s_axi_ctrl_bready  : input  [1-bit]   - Write response ready
+  - s_axi_ctrl_araddr  : input  [16-bit]  - Read address
+  - s_axi_ctrl_arprot  : input  [3-bit]   - Read protection
+  - s_axi_ctrl_arvalid : input  [1-bit]   - Read address valid
+  - s_axi_ctrl_arready : output [1-bit]   - Read address ready
+  - s_axi_ctrl_rdata   : output [32-bit]  - Read data
+  - s_axi_ctrl_rresp   : output [2-bit]   - Read response
+  - s_axi_ctrl_rvalid  : output [1-bit]   - Read valid
+  - s_axi_ctrl_rready  : input  [1-bit]   - Read ready
+
+AXI4-STREAM INPUT DATA (s_axis):
+  - s_axis_tdata  : input  [512-bit]  - Input data bus
+  - s_axis_tvalid : input  [1-bit]    - Input valid
+  - s_axis_tready : output [1-bit]    - Input ready
+  - s_axis_tlast  : input  [1-bit]    - Last beat of vector
+
+AXI4-STREAM OUTPUT DATA (m_axis):
+  - m_axis_tdata  : output [512-bit]  - Output data bus
+  - m_axis_tvalid : output [1-bit]    - Output valid
+  - m_axis_tready : input  [1-bit]    - Output ready
+  - m_axis_tlast  : output [1-bit]    - Last beat of vector
+
+AXI4-STREAM GAMMA WEIGHTS (s_axis_gamma):
+  - s_axis_gamma_tdata  : input  [512-bit]  - Gamma weight data
+  - s_axis_gamma_tvalid : input  [1-bit]    - Gamma valid
+  - s_axis_gamma_tready : output [1-bit]    - Gamma ready
+  - s_axis_gamma_tlast  : input  [1-bit]    - Last gamma beat
+
+--------------------------------------------------------------------------------
+WRAPPER INTERNAL BLOCKS:
+--------------------------------------------------------------------------------
+
++-------------------------------------------------------------------------+
+|                        AXI WRAPPER                                       |
+|                                                                         |
+|  +-----------------+     +-----------------+     +------------------+   |
+|  | AXI4-Lite Slave |     | Soft Reset      |     | Gamma Stream     |   |
+|  | Control Logic   |---->| Extender        |     | DMA Controller   |   |
+|  | (Read/Write)    |     | (16-cycle hold) |     | (addr counter)   |   |
+|  +-----------------+     +-----------------+     +------------------+   |
+|         |                       |                        |              |
+|         v                       v                        v              |
+|  +-----------------+     +-----------------+     +------------------+   |
+|  | Register File   |     | Reset Generator |     | Wide Write Logic |   |
+|  | 0x00: CTRL      |     | core_rst_n =    |     | gamma_we_wide    |   |
+|  | 0x04: STATUS    |     | aresetn &       |     | gamma_addr_wide  |   |
+|  | 0x08: INTR_EN   |     | ~soft_reset_sync|     | gamma_wdata_wide |   |
+|  | 0x0C: INTR_STAT |     +-----------------+     +------------------+   |
+|  | 0x10: EPSILON   |                                    |              |
+|  +-----------------+                                    |              |
+|         |                                               |              |
+|         +---------------------+-------------------------+              |
+|                               |                                        |
+|                               v                                        |
+|  +------------------------------------------------------------------+  |
+|  |                       rms_norm (Core)                            |  |
+|  +------------------------------------------------------------------+  |
+|                                                                         |
++-------------------------------------------------------------------------+
+
+WRAPPER-TO-CORE CONNECTIONS:
+----------------------------
+  core_start        <-- Pulse when CTRL[0] written '1'
+  core_done         --> From core, latched to reg_done
+  core_busy         --> From core, shown in STATUS[0]
+  core_epsilon      <-- reg_epsilon (32-bit FP32)
+  core_rst_n        <-- aresetn & ~soft_reset_sync
+  core_gamma_we_wide    <-- gamma_we_wide (gated by ~gamma_busy)
+  core_gamma_addr_wide  <-- gamma_stream_addr (16-bit)
+  core_gamma_wdata_wide <-- s_axis_gamma_tdata (512-bit)
+  core_gamma_busy       --> gamma_busy from core
+
+INTERRUPT LOGIC:
+  interrupt = reg_intr_status & reg_intr_enable
+  reg_intr_status is SET on core_done, CLEARED by writing '1' to INTR_STATUS
+
+================================================================================
+PART 2: CORE MODULE (rms_norm.sv) - TOP LEVEL VIEW
+================================================================================
+
++-----------------------------------------------------------------------------+
+|                              rms_norm Core                                   |
+|                                                                             |
+|   +-------------------------+    Handoff   +---------------------------+    |
+|   |      INPUT STAGE        |====FIFO====>|      OUTPUT STAGE         |    |
+|   |   (Accumulator FSM)     |   (48-bit)   |   (Normalizer FSM)        |    |
+|   +-------------------------+              +---------------------------+    |
+|            |                                    |              |            |
+|            | write                         read |              |            |
+|            v                                    v              v            |
+|   +-------------------------+              +---------------------------+    |
+|   |   Replay Memory         |------------->|   Normalization Pipeline  |    |
+|   |   (Double Buffered)     |   (read)     |   (16 parallel lanes)     |    |
+|   +-------------------------+              +---------------------------+    |
+|                                                       |                     |
+|   +-------------------------+                         | quantized data      |
+|   |   Gamma Memory          |------------------------>|                     |
+|   |   (Banked BRAM)         |  (gamma weights)        v                     |
+|   +-------------------------+              +---------------------------+    |
+|                                            |   Output Packer           |    |
+|                                            |   (16 lanes → 512-bit)    |    |
+|                                            +---------------------------+    |
+|                                                       |                     |
+|                                                       v                     |
+|                                            +---------------------------+    |
+|                                            |   Output FIFO             |    |
+|                                            |   (AXI-Stream Skid)       |    |
+|                                            +---------------------------+    |
+|                                                       |                     |
+|                                                       v                     |
+|                                            +---------------------------+    |
+|                                            |   m_axis Output           |    |
+|                                            +---------------------------+    |
+|                                                                             |
++-----------------------------------------------------------------------------+
+
+================================================================================
+PART 3: INPUT STAGE (Accumulator FSM) - DETAILED DATAPATH
+================================================================================
+
+FSM STATES:
+-----------
+  S_IN_IDLE (0)       --> Wait for start or data
+  S_IN_ACCUM (1)      --> Accumulate input data
+  S_IN_DRAIN (2)      --> Wait for pipeline to drain
+  S_IN_REDUCE_INIT (3)--> Initialize partial sum reduction
+  S_IN_REDUCE (4)     --> Reduce 8 accumulators to total_sum
+
+STATE TRANSITIONS:
+  IDLE --[start | s_axis_tvalid]--> ACCUM
+  ACCUM --[tlast received]---------> DRAIN
+  DRAIN --[pipeline_done]----------> REDUCE_INIT
+  REDUCE_INIT --[7 cycles wait]----> REDUCE
+  REDUCE --[reduce_done]-----------> ACCUM (next vector)
+
+--------------------------------------------------------------------------------
+INPUT STAGE DATAPATH BLOCKS:
+--------------------------------------------------------------------------------
+
+s_axis_tdata [512-bit, INT32]
+     |
+     v
++-------------------+
+| INPUT UNPACKER    |  Extract 16 lanes from 512-bit bus
+| [16 x 32-bit]     |  Formula: input_lane[i] = tdata[i*32 +: 32]
++-------------------+
+     |
+     | input_lane[0:15] [16 x 32-bit signed]
+     v
++-------------------+
+| INT-to-FP32       |  16 parallel instances of int_to_fp
+| CONVERTERS        |  Latency: 3 cycles
+| [16 instances]    |  Output: fp32_lane[0:15] + fp32_valid[0:15]
++-------------------+
+     |
+     | fp32_lane[0:15] [16 x 32-bit FP32]
+     v
++-------------------+
+| PIPELINE          |  1 cycle register stage for timing closure
+| REGISTER          |  Output: fp32_lane_reg[0:15] + fp32_valid_reg[0:15]
++-------------------+
+     |
+     v
++-------------------+
+| FP32 SQUARERS     |  16 parallel instances of fp_mul (a*a)
+| x² Computation    |  Latency: 5 cycles (DSP48E2)
+| [16 instances]    |  Output: squared_lane[0:15] + squared_valid[0:15]
++-------------------+
+     |
+     | squared_lane[0:15] [16 x 32-bit FP32]
+     v
++-------------------+
+| ADDER TREE        |  Pipelined reduction: 16 → 8 → 4 → 2 → 1
+| (4 levels)        |  Level 0: 8 fp_add instances (16→8)
+|                   |  Level 1: 4 fp_add instances (8→4)
+| Each fp_add:      |  Level 2: 2 fp_add instances (4→2)
+| 7 cycle latency   |  Level 3: 1 fp_add instance  (2→1)
+|                   |  Total latency: 4 × 7 = 28 cycles
++-------------------+
+     |
+     | sum_stage3 [32-bit FP32] + sum_valid_s3
+     v
++---------------------------------------+
+| INTERLEAVED ACCUMULATORS              |
+| [8 accumulators: partial_acc[0:7]]    |
+|                                       |
+|   +---------------+                   |
+|   | Round-Robin   |  acc_sel cycles 0→1→2→3→4→5→6→7→0...
+|   | Selector      |  Avoids RAW hazard from 7-cycle fp_add
+|   +---------------+                   |
+|          |                            |
+|          v                            |
+|   +---------------+                   |
+|   | ACC ADDER     |  acc_result = sum_stage3 + partial_acc[acc_sel]
+|   | (fp_add)      |  Latency: 7 cycles
+|   | 7 cycles      |  acc_sel_delayed tracks which acc to update
+|   +---------------+                   |
+|          |                            |
+|          v                            |
+|   +---------------+                   |
+|   | 8 PARTIAL     |  partial_acc[acc_sel_delayed] <= acc_result
+|   | ACCUMULATORS  |  Each accumulator updated every 8 input beats
+|   | [8 x 32-bit]  |                   |
+|   +---------------+                   |
++---------------------------------------+
+     |
+     | After DRAIN state, accumulators are stable
+     v
++---------------------------------------+
+| PIPELINED TREE REDUCER                |
+| 8 partial accumulators → total_sum    |
+|                                       |
+|  LEVEL 1 (8→4):                       |
+|    tree_l1[0] = acc[0] + acc[1]       |
+|    tree_l1[1] = acc[2] + acc[3]       |
+|    tree_l1[2] = acc[4] + acc[5]       |
+|    tree_l1[3] = acc[6] + acc[7]       |
+|    (4 fp_add, 7 cycles)               |
+|                                       |
+|  LEVEL 2 (4→2):                       |
+|    tree_l2[0] = tree_l1[0] + tree_l1[1]|
+|    tree_l2[1] = tree_l1[2] + tree_l1[3]|
+|    (2 fp_add, 7 cycles)               |
+|                                       |
+|  LEVEL 3 (2→1):                       |
+|    total_sum = tree_l2[0] + tree_l2[1]|
+|    (1 fp_add, 7 cycles)               |
+|                                       |
+|  Total latency: 21 cycles             |
++---------------------------------------+
+     |
+     | total_sum [32-bit FP32] + element_count [16-bit]
+     v
++-------------------+
+| HANDOFF FIFO      |  Depth: 32, Width: 48 bits
+| {sum,count}       |  Payload: {total_sum[31:0], element_count[15:0]}
+|                   |  Push: handoff_push (reduce_done)
+|                   |  Pop:  handoff_pop (output FSM accepts)
++-------------------+
+     |
+     +--> To OUTPUT STAGE
+
+--------------------------------------------------------------------------------
+REPLAY MEMORY (Double-Buffered DPRAM):
+--------------------------------------------------------------------------------
+
++-------------------------------------------+
+|          REPLAY MEMORY                     |
+|  16 banks × (MAX_VECTOR_SIZE/16) depth    |
+|                                           |
+|  +---+  +---+  +---+       +---+          |
+|  |B0 |  |B1 |  |B2 | ..... |B15|          |
+|  +---+  +---+  +---+       +---+          |
+|  32b    32b    32b         32b            |
+|                                           |
+|  ADDRESS: {wr_page, fifo_wptr}            |
+|           {rd_page, fifo_rptr}            |
+|                                           |
+|  Double buffering via page bit:           |
+|    - wr_page toggles on handoff_push      |
+|    - rd_page toggles when output complete |
++-------------------------------------------+
+
+  Write: fifo_we = s_axis_tvalid & s_axis_tready & (state_in == S_IN_ACCUM)
+  Read:  fifo_re = (state_out == S_OUT_STREAM) & credit_available & (stream_fed_count < vector_len)
+
+================================================================================
+PART 4: OUTPUT STAGE (Normalizer FSM) - DETAILED DATAPATH
+================================================================================
+
+FSM STATES:
+-----------
+  S_OUT_IDLE (0)      --> Wait for handoff FIFO
+  S_OUT_WAIT_CMD (1)  --> Latch FIFO output
+  S_OUT_CALC_MEAN (2) --> Compute mean = total_sum / N
+  S_OUT_CALC_INV (3)  --> Compute inv_rms = 1/sqrt(mean+eps)
+  S_OUT_STREAM (4)    --> Stream normalized output
+  S_OUT_DONE (5)      --> Wait for output FIFO drain
+
+STATE TRANSITIONS:
+  IDLE --[!handoff_empty]---------> WAIT_CMD
+  WAIT_CMD -----------------------> CALC_MEAN
+  CALC_MEAN --[div_mean_valid]----> CALC_INV
+  CALC_INV --[inv_sqrt_valid]-----> STREAM
+  STREAM --[output_count >= len]--> DONE
+  DONE --[output_fifo_empty]------> IDLE
+
+--------------------------------------------------------------------------------
+MEAN CALCULATION BLOCKS:
+--------------------------------------------------------------------------------
+
+total_sum_reg [32-bit FP32]     vector_len_reg [16-bit]
+     |                               |
+     |                               v
+     |                          +-------------------+
+     |                          | INT-to-FP32       |
+     |                          | Converter         |
+     |                          | Latency: 3 cycles |
+     |                          +-------------------+
+     |                               |
+     |                               | n_fp32 [32-bit FP32]
+     v                               v
++------------------------------------------+
+| FP DIVIDER (fp_div)                      |
+| a = total_sum_reg                        |
+| b = n_fp32                               |
+| result = mean = sum / N                  |
+| Latency: ~32 cycles                      |
++------------------------------------------+
+     |
+     | div_mean_result [32-bit FP32]
+     v
++------------------------------------------+
+| EPSILON ADDER (fp_add)                   |
+| a = div_mean_result                      |
+| b = cfg_epsilon                          |
+| result = mean + epsilon                  |
+| Latency: 7 cycles                        |
++------------------------------------------+
+     |
+     | eps_add_result [32-bit FP32]
+     v
++------------------------------------------+
+| FAST INVERSE SQRT (quake_fastinverse)    |
+| Input: mean + epsilon                    |
+| Output: 1 / sqrt(mean + epsilon)         |
+| Algorithm: Quake's fast inverse sqrt     |
+|            + Newton-Raphson refinement   |
+| Latency: 23 cycles (1 iteration)         |
+|          45 cycles (2 iterations)        |
++------------------------------------------+
+     |
+     | inv_rms [32-bit FP32]  (latched on valid)
+     v
+   To NORMALIZATION PIPELINE
+
+--------------------------------------------------------------------------------
+NORMALIZATION PIPELINE (16 PARALLEL LANES):
+--------------------------------------------------------------------------------
+
+From Replay Memory                    From Gamma Memory
+replay_data_raw[0:15]                 gamma_raw[0:15]
+[16 x 32-bit INT32]                   [16 x 32-bit FP32]
+     |                                     |
+     | (1 cycle BRAM latency)              | (1 cycle BRAM latency)
+     v                                     |
++-------------------+                      |
+| INT-to-FP32       |                      |
+| CONVERTERS        |                      |
+| [16 instances]    |                      |
+| Latency: 3 cycles |                      |
++-------------------+                      |
+     |                                     |
+     | replay_fp32[0:15]                   |
+     v                                     |
++-------------------+                      |
+| PIPELINE          |                      |
+| REGISTER          |                      |
+| Latency: 1 cycle  |                      |
++-------------------+                      |
+     |                                     |
+     | replay_fp32_reg[0:15]               |
+     v                                     |
++-------------------+                      |
+| NORMALIZE         |                      |
+| MULTIPLIERS       |                      |
+| norm = x * inv_rms|                      |
+| [16 x fp_mul]     |                      |
+| Latency: 5 cycles |                      |
++-------------------+                      |
+     |                                     |
+     | norm_lane[0:15]                     |
+     v                                     v
++-------------------------------------------+
+| DELAY LINE                                |
+| (9 cycles to align gamma with norm_lane)  |
+| GAMMA_DELAY_CYCLES = 9                    |
+| [16 x delay modules]                      |
++-------------------------------------------+
+     |                                gamma_lane[0:15]
+     v                                     |
++-------------------------------------------+
+| GAMMA MULTIPLIERS                         |
+| scaled = norm * gamma                     |
+| [16 x fp_mul]                             |
+| Latency: 5 cycles                         |
++-------------------------------------------+
+     |
+     | gamma_scaled[0:15] [16 x 32-bit FP32]
+     v
++-------------------+
+| PIPELINE          |
+| REGISTER          |
+| Latency: 1 cycle  |
++-------------------+
+     |
+     | gamma_scaled_reg[0:15]
+     v
++-------------------------------------------+
+| OUTPUT QUANTIZER                          |
+|                                           |
+| If PRECISION == "BF16":                   |
+|   cast_fp32_to_bf16 [16 instances]        |
+|   Latency: 1 cycles                       |
+|   Output: 16-bit bfloat16                 |
+|                                           |
+| If PRECISION == "INT8":                   |
+|   fp_to_int [16 instances]                |
+|   + saturation to [-128, 127]             |
+|   Latency: 5 cycles                       |
+|   Output: 8-bit signed integer            |
++-------------------------------------------+
+     |
+     | output_quant[0:15] [16 x 16-bit or 8-bit]
+     v
++-------------------------------------------+
+| OUTPUT PACKER                             |
+|                                           |
+| For BF16: PACK_BEATS = 32/16 = 2          |
+|   - 2 internal cycles fill 512-bit output |
+|   - output_pack_buf accumulates 32 x 16b  |
+|                                           |
+| For INT8: PACK_BEATS = 64/16 = 4          |
+|   - 4 internal cycles fill 512-bit output |
+|   - output_pack_buf accumulates 64 x 8b   |
+|                                           |
+| pack_valid_comb when pack_beat_cnt = max  |
++-------------------------------------------+
+     |
+     | pack_data_comb [512-bit]
+     v
++-------------------------------------------+
+| OUTPUT FIFO (axis_fifo_banked)            |
+|                                           |
+| Depth: 256 entries                        |
+| Width: 512 + 1 (data + tlast)             |
+| Features: Skid buffer for AXI compliance  |
+|                                           |
+| Input: pack_data_comb, pack_valid_comb    |
+| Output: m_axis_tdata, m_axis_tvalid       |
++-------------------------------------------+
+     |
+     v
+m_axis_tdata [512-bit]
+m_axis_tvalid
+m_axis_tlast
+
+================================================================================
+PART 5: GAMMA MEMORY SUBSYSTEM
+================================================================================
+
++-----------------------------------------------------------------------+
+|                        GAMMA MEMORY                                    |
+|                                                                       |
+|  WRITE PORT (DMA from wrapper):                                       |
+|    gamma_we_wide_gated = gamma_we_wide & ~gamma_busy                  |
+|    gamma_addr_wide [16-bit]                                           |
+|    gamma_wdata_wide [512-bit]                                         |
+|                                                                       |
+|  16 BRAM BANKS (for 16 lanes):                                        |
+|  +------+ +------+ +------+ +------+ +------+ +------+ +------+ +------+
+|  |Bank0 | |Bank1 | |Bank2 | |Bank3 | |Bank4 | |Bank5 | |Bank6 | |Bank7 |
+|  +------+ +------+ +------+ +------+ +------+ +------+ +------+ +------+
+|  +------+ +------+ +------+ +------+ +------+ +------+ +------+ +------+
+|  |Bank8 | |Bank9 | |Bank10| |Bank11| |Bank12| |Bank13| |Bank14| |Bank15|
+|  +------+ +------+ +------+ +------+ +------+ +------+ +------+ +------+
+|                                                                       |
+|  Each bank: GAMMA_BANK_DEPTH = MAX_VECTOR_SIZE / NUM_LANES entries    |
+|             = 12288 / 16 = 768 entries                                |
+|  Each entry: 32-bit FP32                                              |
+|                                                                       |
+|  512-bit write: All 16 banks written simultaneously (1 row/beat)      |
+|  256-bit write: Banks 0-7 or 8-15 per beat (2 beats/row)              |
+|                                                                       |
+|  READ PORT (during normalization):                                    |
+|    gamma_rd_addr [16-bit] - increments by NUM_LANES on each fifo_re   |
+|    gamma_raw[0:15] - read data, 1 cycle latency                       |
+|    gamma_busy - blocks writes during S_OUT_STREAM, S_OUT_CALC_INV     |
++-----------------------------------------------------------------------+
+
+================================================================================
+PART 6: OUTPUT FIFO WITH CREDIT-BASED FLOW CONTROL
+================================================================================
+
+The Output FIFO includes an integrated credit system to prevent overflow.
+
++-----------------------------------------------------------------------+
+|                 OUTPUT FIFO SUBSYSTEM                                  |
+|                                                                       |
+|  +-----------------------------+    +---------------------------+     |
+|  |      CREDIT CONTROLLER      |    |       OUTPUT FIFO         |     |
+|  |      (Flow Control)         |--->|   (axis_fifo_banked)      |     |
+|  +-----------------------------+    +---------------------------+     |
+|                                                                       |
+|  CREDIT CONTROLLER:                                                   |
+|  -----------------                                                    |
+|  Purpose: Prevent Output FIFO overflow during downstream backpressure |
+|                                                                       |
+|  CREDIT_DEPTH = 2 * PIPE_DEPTH (covers in-flight pipeline data)       |
+|                                                                       |
+|  +-----------------+                                                  |
+|  | CREDIT COUNTER  |  credit_counter [CW-bit]                         |
+|  | (up/down)       |  Initialized to CREDIT_DEPTH at S_OUT_IDLE       |
+|  +-----------------+                                                  |
+|         |                                                             |
+|         v                                                             |
+|  credit_available = (credit_counter >= OUTPUTS_PER_INPUT)             |
+|  fifo_re = (state_out == S_OUT_STREAM) & credit_available &           |
+|            (stream_fed_count < vector_len_reg)                        |
+|                                                                       |
+|  CREDIT CONSUME (decrement):                                          |
+|    When: fifo_re && (credit_beat_cnt == INPUTS_PER_OUTPUT - 1)        |
+|    Amount: OUTPUTS_PER_INPUT credits                                  |
+|                                                                       |
+|  CREDIT RETURN (increment):                                           |
+|    When: m_axis_tvalid && m_axis_tready (output consumed from FIFO)   |
+|    Amount: 1 credit                                                   |
+|                                                                       |
+|  OUTPUT FIFO (axis_fifo_banked):                                      |
+|  ------------------------------                                       |
+|  Depth: 256 entries                                                   |
+|  Width: 512 + 1 (data + tlast)                                        |
+|  Features: Skid buffer for AXI-Stream protocol compliance             |
+|                                                                       |
+|  This ensures the normalization pipeline never pushes more data       |
+|  than the Output FIFO can hold, even during extended backpressure.    |
++-----------------------------------------------------------------------+
+
+================================================================================
+PART 7: HANDOFF FIFO (DECOUPLING)
+================================================================================
+
++-----------------------------------------------------------------------+
+|                       HANDOFF FIFO                                     |
+|                                                                       |
+|  Purpose: Decouple INPUT and OUTPUT FSMs for concurrent processing    |
+|                                                                       |
+|  Width: 48 bits                                                       |
+|  Depth: 32 entries                                                    |
+|  Payload: {total_sum[31:0], element_count[15:0]}                      |
+|                                                                       |
+|  INPUT SIDE (push):                                                   |
+|    handoff_din = {total_sum, element_count}                           |
+|    handoff_push = (state_in == S_IN_REDUCE) && reduce_done            |
+|                                                                       |
+|  OUTPUT SIDE (pop):                                                   |
+|    handoff_pop = (state_out == S_OUT_IDLE) && !handoff_empty          |
+|    {total_sum_reg, vector_len_reg} = handoff_dout (latched)           |
+|                                                                       |
+|  Enables: Input FSM can start vector N+1 while Output FSM             |
+|           processes vector N (ping-pong operation)                    |
++-----------------------------------------------------------------------+
+
+================================================================================
+PART 8: PIPELINE LATENCY BREAKDOWN
+================================================================================
+
+INPUT PATH (accumulation):
+--------------------------
+  INT→FP32:        3 cycles
+  FP32 register:   1 cycle
+  Squaring:        5 cycles
+  Adder tree:     28 cycles (4 levels × 7 cycles)
+  Acc addition:    7 cycles
+  --------------------------
+  TOTAL:          44 cycles (input to accumulator update)
+
+MEAN CALCULATION:
+-----------------
+  N→FP32:          3 cycles
+  Division:       32 cycles
+  Add epsilon:     7 cycles
+  --------------------------
+  TOTAL:          50 cycles
+
+INVERSE SQRT:
+-------------
+  Fast inverse:   23 cycles (1 iteration)
+             or   45 cycles (2 iterations)
+
+OUTPUT PATH (normalization per element):
+----------------------------------------
+  BRAM read:       1 cycle
+  INT→FP32:        3 cycles
+  Pipeline reg:    1 cycle
+  Norm multiply:   5 cycles
+  Gamma multiply:  5 cycles
+  Pipeline reg:    1 cycle
+  Quantization:    4 cycles (BF16) or 6 cycles (INT8)
+  --------------------------
+  TOTAL:          21-23 cycles (FIFO read to packer)
+
+GAMMA DELAY LINE:
+-----------------
+  GAMMA_DELAY_CYCLES = 9 cycles
+  (Aligns gamma read with norm_lane output)
+
+================================================================================
+PART 9: SIGNAL FLOW SUMMARY (FOR BLOCK DIAGRAM)
+================================================================================
+
+MAIN DATA FLOW (left to right):
+-------------------------------
+s_axis_tdata→UNPACK→INT2FP→SQUARE→ADDER_TREE→ACCUMULATORS→
+    →REDUCER→HANDOFF_FIFO→MEAN_CALC→INV_SQRT→
+    →REPLAY_READ→INT2FP→NORM_MUL→GAMMA_MUL→QUANTIZE→PACKER→
+    →OUTPUT_FIFO→m_axis_tdata
+
+PARALLEL DATA PATHS:
+--------------------
+1. Input data → Replay Memory (write)
+2. Replay Memory → Normalization pipeline (read)
+3. Gamma weights → Gamma Memory → Normalization pipeline
+4. s_axis_gamma → Wrapper → Gamma DMA → Gamma Memory
+
+CONTROL SIGNALS:
+----------------
+  s_axi_ctrl → Wrapper → core_start, core_epsilon, soft_reset
+  core_done → Wrapper → reg_done → interrupt
+  state_in, state_out: FSM control for data flow
+
+KEY HANDSHAKE POINTS:
+---------------------
+1. s_axis: tvalid/tready/tlast at input
+2. Handoff FIFO: push/pop between Input FSM and Output FSM
+3. Output FIFO Subsystem:
+   - Credit Controller: credit_available gates Replay Memory reads (fifo_re)
+   - Output FIFO: pack_valid/fifo_ready from packer to FIFO input
+   - Skid Buffer: handles m_axis backpressure
+4. m_axis: tvalid/tready/tlast at output (connected to Output FIFO)
+
+================================================================================
+PART 10: INSTANTIATION COUNTS (FOR DIAGRAM)
+================================================================================
+
+CORE PROCESSING ELEMENTS (NUM_LANES = 16):
+------------------------------------------
+- int_to_fp converters:       16 (input) + 16 (replay) + 1 (N conv) = 33
+- fp_mul multipliers:         16 (square) + 16 (norm) + 16 (gamma) = 48
+- fp_add adders:              8+4+2+1 (tree) + 1 (acc) + 4+2+1 (reduce) + 1 (eps) = 24
+- fp_div dividers:            1 (mean calculation)
+- quake_fastinverse:          1 (inverse sqrt)
+- cast_fp32_to_bf16/fp_to_int: 16 (output quantization)
+- delay modules:              16 (gamma alignment, 9 cycles each)
+
+MEMORY ELEMENTS:
+----------------
+- Replay DPRAM banks:         16 banks × (MAX_SIZE/16) depth × 32-bit
+- Gamma BRAM banks:           16 banks × (MAX_SIZE/16) depth × 32-bit
+- Handoff FIFO:               1 × 32-deep × 48-bit
+- Output FIFO:                1 × 256-deep × 513-bit (with skid buffer)
+- Partial accumulators:       8 × 32-bit registers
+
+CONTROL REGISTERS (in Wrapper):
+-------------------------------
+- reg_epsilon:    32-bit
+- reg_done:       1-bit
+- reg_intr_enable: 1-bit
+- reg_intr_status: 1-bit
+
+================================================================================
+PART 11: INTUITIVE COMPUTATION FLOW EXPLANATION
+================================================================================
+
+This section explains what each computational block does and why it's needed.
+
+THE MATH WE'RE COMPUTING:
+-------------------------
+RMSNorm(x) = (x / sqrt(mean(x²) + ε)) × γ
+
+Where:
+- x = input vector (e.g., 1152 INT32 values)
+- ε = epsilon (small number like 1e-5 to avoid divide-by-zero)
+- γ = gamma weights (learned parameters)
+
+--------------------------------------------------------------------------------
+BLOCK 1: INT2FP (Integer to Floating Point)
+--------------------------------------------------------------------------------
+WHAT IT DOES: Converts integer input to 32-bit floating point (FP32)
+
+WHY NEEDED: Input comes as INT32 (e.g., 42) but we need FP32 (42.0) to do
+floating-point math. The core does ALL computation in FP32 for precision.
+
+EXAMPLE:
+  INT32: -1234 → FP32: 0xC49A4000 (-1234.0)
+
+LATENCY: 3 cycles
+
+--------------------------------------------------------------------------------
+BLOCK 2: FP_MUL (Floating Point Multiplier) - Squaring
+--------------------------------------------------------------------------------
+WHAT IT DOES: Computes x² for each element
+
+WHY NEEDED: RMSNorm needs mean(x²) - the mean of squared values.
+First step is squaring each input.
+
+EXAMPLE (16 lanes in parallel):
+  Lane 0:  3.0 × 3.0 = 9.0
+  Lane 1: -2.0 × -2.0 = 4.0
+  Lane 2:  5.0 × 5.0 = 25.0
+  ...
+  Lane 15: 1.5 × 1.5 = 2.25
+
+LATENCY: 5 cycles (using DSP48E2)
+
+--------------------------------------------------------------------------------
+BLOCK 3: FP_ADD Tree (Adder Tree) - Parallel Reduction
+--------------------------------------------------------------------------------
+WHAT IT DOES: Sums 16 squared values down to 1 sum per clock cycle
+
+WHY A TREE? Adding 16 numbers one-by-one takes 15 cycles.
+A tree does it in log₂(16) = 4 levels!
+
+HOW IT WORKS:
+  Level 0 (16 inputs): [9, 4, 25, 16, 1, 36, 49, 64, 81, 100, 4, 9, 16, 25, 36, 49]
+                        ↓  ↓   ↓   ↓   ↓   ↓   ↓   ↓
+  Level 1 (8 sums):    [13,    41,    37,     113,    181,    13,     41,     85]
+                        ↓       ↓       ↓       ↓
+  Level 2 (4 sums):    [54,           150,           194,           126]
+                        ↓               ↓
+  Level 3 (2 sums):    [204,                         320]
+                             ↓
+  Level 4 (1 sum):         [524] ← Sum of all 16 squared values!
+
+Each level uses fp_add modules (7 cycles each), so total = 4 × 7 = 28 cycles.
+
+TREE VISUAL:
+     a0  a1   a2  a3   a4  a5   a6  a7   a8  a9  a10 a11  a12 a13  a14 a15
+      \  /     \  /     \  /     \  /     \  /     \  /     \  /     \  /
+       \/       \/       \/       \/       \/       \/       \/       \/
+       s0       s1       s2       s3       s4       s5       s6       s7    ← Level 1
+        \       /         \       /         \       /         \       /
+         \     /           \     /           \     /           \     /
+          \   /             \   /             \   /             \   /
+           s8               s9                s10               s11        ← Level 2
+            \               /                   \               /
+             \             /                     \             /
+              \           /                       \           /
+               s12                               s13                       ← Level 3
+                 \                               /
+                  \                             /
+                   \                           /
+                            TOTAL_SUM                                      ← Level 4
+
+--------------------------------------------------------------------------------
+BLOCK 4: Interleaved Accumulators (8 of them)
+--------------------------------------------------------------------------------
+WHAT IT DOES: Accumulates tree outputs across multiple clock cycles
+
+WHY 8? The accumulator adder has 7-cycle latency. If we used 1 accumulator,
+we'd have a pipeline bubble (RAW hazard). With 8 accumulators cycling
+round-robin, we keep the pipeline full:
+
+  Cycle 0: Add to acc[0]
+  Cycle 1: Add to acc[1]
+  Cycle 2: Add to acc[2]
+  ...
+  Cycle 7: Add to acc[7]
+  Cycle 8: Add to acc[0] ← acc[0] result from cycle 0 is now ready!
+
+--------------------------------------------------------------------------------
+BLOCK 5: FP_DIV (Floating Point Divider) - Mean Calculation
+--------------------------------------------------------------------------------
+WHAT IT DOES: Computes mean = total_sum / N
+
+EXAMPLE:
+  total_sum = 1,234,567.0 (sum of all x²)
+  N = 1152 (vector length)
+  mean = 1,234,567.0 / 1152.0 = 1071.67...
+
+LATENCY: ~32 cycles (division is slow!)
+
+--------------------------------------------------------------------------------
+BLOCK 6: Epsilon Addition
+--------------------------------------------------------------------------------
+WHAT IT DOES: Adds small epsilon to prevent divide-by-zero
+
+  mean_plus_eps = mean + 0.00001
+
+If input is all zeros, mean = 0, and 1/sqrt(0) would explode.
+Epsilon prevents this numerical instability.
+
+LATENCY: 7 cycles
+
+--------------------------------------------------------------------------------
+BLOCK 7: Quake Fast Inverse Square Root
+--------------------------------------------------------------------------------
+WHAT IT DOES: Computes 1 / sqrt(mean + ε) FAST
+
+THE MAGIC: Instead of computing sqrt(x) then 1/x (two expensive operations),
+we use the famous "Quake III" algorithm that does both in one step!
+
+ALGORITHM (C pseudocode):
+  float Q_rsqrt(float x) {
+      int i = *(int*)&x;              // Bit-level float reinterpretation
+      i = 0x5F3759DF - (i >> 1);      // Magic constant! Initial guess
+      float y = *(float*)&i;
+      y = y * (1.5f - 0.5f*x*y*y);    // Newton-Raphson refinement
+      return y;
+  }
+
+WHY IT'S FAST: Magic constant gives ~1% accurate initial guess,
+Newton-Raphson gets it to <0.1% error in just 1-2 iterations.
+
+LATENCY: 23 cycles (1 iteration) or 45 cycles (2 iterations)
+
+--------------------------------------------------------------------------------
+BLOCK 8: Normalization Multipliers
+--------------------------------------------------------------------------------
+Now we have inv_rms = 1/sqrt(mean+ε). We multiply each original input by it:
+
+  normalized[i] = original[i] × inv_rms
+
+LATENCY: 5 cycles per fp_mul
+
+--------------------------------------------------------------------------------
+BLOCK 9: Gamma Multiplication
+--------------------------------------------------------------------------------
+WHAT IT DOES: Applies learned weights
+
+  output[i] = normalized[i] × gamma[i]
+
+Each position has its own gamma weight (stored in BRAM).
+
+LATENCY: 5 cycles per fp_mul
+
+--------------------------------------------------------------------------------
+BLOCK 10: DELAY Lines (for alignment)
+--------------------------------------------------------------------------------
+WHAT THEY DO: Hold data so parallel paths arrive at the same time
+
+THE PROBLEM: Gamma weights are read from BRAM (1 cycle), but the normalized
+values go through INT2FP(3) + register(1) + multiply(5) = 9 cycles.
+If we multiply immediately, gamma and norm_lane would be misaligned!
+
+SOLUTION: Delay gamma_raw by 9 cycles:
+
+  Cycle 0:  Gamma read starts    |  Replay read starts
+  Cycle 1:  gamma_raw valid      |  INT2FP stage 1
+  Cycle 2:  delay[0]             |  INT2FP stage 2
+  Cycle 3:  delay[1]             |  INT2FP stage 3
+  Cycle 4:  delay[2]             |  Pipeline reg
+  Cycle 5:  delay[3]             |  fp_mul (norm) stage 1
+  Cycle 6:  delay[4]             |  fp_mul (norm) stage 2
+  Cycle 7:  delay[5]             |  fp_mul (norm) stage 3
+  Cycle 8:  delay[6]             |  fp_mul (norm) stage 4
+  Cycle 9:  delay[7]             |  fp_mul (norm) stage 5
+  Cycle 10: gamma_lane ready     |  norm_lane ready  ← ALIGNED!
+
+--------------------------------------------------------------------------------
+BLOCK 11: CAST (FP32 to BF16 or INT8)
+--------------------------------------------------------------------------------
+WHAT IT DOES: Converts FP32 result to output format
+
+BF16 (bfloat16): Just truncate/round mantissa from 23→7 bits
+  FP32:  [1 sign][8 exp][23 mantissa] = 32 bits
+  BF16:  [1 sign][8 exp][7 mantissa]  = 16 bits
+  Easy! Keep sign+exponent, round mantissa.
+
+INT8: More complex - convert float to integer with saturation
+  FP32: 127.8  → INT8: 127  (saturated)
+  FP32: -200.5 → INT8: -128 (saturated)
+
+LATENCY: 3-4 cycles
+
+--------------------------------------------------------------------------------
+COMPLETE PIPELINE VISUAL
+--------------------------------------------------------------------------------
+
+INPUT (512-bit, 16×INT32)
+    ↓
+[INT2FP ×16] ──────────────────────────────────►[REPLAY BRAM]
+    ↓ (3 cyc)                                         │
+[REGISTER]                                            │
+    ↓ (1 cyc)                                         │
+[SQUARE ×16]                                          │
+    ↓ (5 cyc)                                         │
+[ADDER TREE] 16→8→4→2→1                               │
+    ↓ (28 cyc)                                        │
+[ACCUMULATORS ×8]                                     │
+    ↓ (7 cyc)                                         │
+[TREE REDUCER] 8→4→2→1                                │
+    ↓ (21 cyc)                                        │
+[total_sum, N]                                        │
+    ↓                                                 │
+=== HANDOFF FIFO ===                                  │
+    ↓                                                 ↓
+[INT2FP] N→FP32                               [INT2FP ×16] (replay data)
+    ↓ (3 cyc)                                         ↓ (3 cyc)
+[FP_DIV] sum/N                                [REGISTER]
+    ↓ (32 cyc)                                        ↓ (1 cyc)
+[FP_ADD] +epsilon                             [NORM_MUL ×16] ×inv_rms
+    ↓ (7 cyc)                                         ↓ (5 cyc)
+[QUAKE] 1/sqrt()  ──────inv_rms──────────────────────►│
+    ↓ (23 cyc)                                        │
+                                              [GAMMA_MUL ×16] ×gamma
+                                      gamma_lane──────►↓ (5 cyc)
+                                      (delayed 9 cyc)  │
+                                              [REGISTER]
+                                                      ↓ (1 cyc)
+                                              [CAST ×16] FP32→BF16
+                                                      ↓ (1 cyc)
+                                              [OUTPUT PACKER]
+                                                      ↓
+                                              [OUTPUT FIFO]
+                                                      ↓
+                                              OUTPUT (512-bit)
+
+This is the complete computation flow! Each block is pipelined so while one
+element is being squared, another is being converted, and another is going
+through the adder tree - all simultaneously for maximum throughput.
+
+================================================================================
+END OF RTL BLOCK DIAGRAM SPECIFICATION
+================================================================================
