@@ -2,3 +2,4 @@
 scripts/golden_mem/*
 sim/log_folder/*
 paper/*
+build/*

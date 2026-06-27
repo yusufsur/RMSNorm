@@ -97,6 +97,10 @@ module rms_norm_axi_wrapper #(
     if (DATA_WIDTH < NUM_LANES * ((INPUT_PRECISION == "INT8") ? 8 : 32))
       $fatal(1, "DATA_WIDTH (%0d) must be >= NUM_LANES (%0d) * INPUT_BITS (%0d)", DATA_WIDTH, NUM_LANES, (INPUT_PRECISION == "INT8") ? 8 : 32);
 
+  logic core_start;
+  logic core_done;
+  logic soft_reset_sync;  // registered version
+
   // Debug prints (when enabled)
   generate
     if (DEBUG)
@@ -118,8 +122,6 @@ module rms_norm_axi_wrapper #(
   //=========================================================================
 
   // Core interface
-  logic        core_start;
-  logic        core_done;
   logic        core_busy;
   logic [31:0] core_epsilon;
 
@@ -134,7 +136,6 @@ module rms_norm_axi_wrapper #(
   // Reset & control
   logic        core_rst_n;
   logic        soft_reset;
-  logic        soft_reset_sync;  // registered version
 
   logic        reg_done;
   logic        reg_intr_enable;

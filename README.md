@@ -241,6 +241,29 @@ Since the MAX_VECTOR_SIZE only affects the BRAM usage it is better to use it wit
 
 ## Usage
 
+### Run The Testbench
+
+From the repo root:
+
+```powershell
+cd scripts
+python generate_test_vectors.py
+cd ..
+powershell -ExecutionPolicy Bypass -File scripts\run_tb.ps1 -Sim xsim -Tb wrapper
+```
+
+Core-only TB:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_tb.ps1 -Sim xsim -Tb core
+```
+
+Compile only:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_tb.ps1 -Sim xsim -Tb wrapper -NoRun
+```
+
 ### Basic Operation Sequence
 
 ```

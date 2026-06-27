@@ -75,6 +75,7 @@ module rms_norm #(
   localparam FIFO_ADDR_W    = $clog2(FIFO_DEPTH);
   localparam FP32_WIDTH     = 32;
   localparam FP32_ONE       = 32'h3F800000;
+  localparam FP_ADD_LATENCY = 7;   // fp_add pipeline depth
 
   // Number of interleaved accumulators = FP adder latency + 1
   // Need +1 to avoid feedback hazard when consecutive accesses overlap
@@ -136,7 +137,6 @@ module rms_norm #(
   //===========================================================================
   // Pipeline Shift Registers
   //===========================================================================
-  localparam FP_ADD_LATENCY    = 7;   // fp_add pipeline depth
   localparam LAT_INT_FP        = 3;
   localparam LAT_FP_REG        = 1;
   localparam LAT_FP_MUL        = 5;
@@ -171,6 +171,8 @@ module rms_norm #(
   logic          credit_consume;    // When we produce an output beat (every N inputs)
   logic          credit_return;     // When output is consumed
   logic [3:0]    credit_beat_cnt;   // Count input beats (0-15)
+  logic          fifo_ready;
+  logic          output_fifo_empty;
 
   // Calculate Ratios for Credit Control
   // PACK_BEATS = how many internal reads (fifo_re) produce one output AXI beat
@@ -1557,7 +1559,6 @@ module rms_norm #(
   //===========================================================================
 
   logic pack_last_to_fifo;
-  logic fifo_ready;
 
   // Pack data for FIFO input
   always_comb
@@ -1592,7 +1593,6 @@ module rms_norm #(
                      .fifo_empty(output_fifo_empty),
                      .fifo_full()
                    );
-  logic output_fifo_empty;
 
   assign m_axis_tvalid = fifo_tvalid;
   assign m_axis_tdata  = fifo_tdata;
